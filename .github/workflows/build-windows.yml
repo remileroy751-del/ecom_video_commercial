@@ -1,0 +1,78 @@
+name: Build EcomVideoStudio Windows (version commerciale)
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      npm_config_fetch_retries: "5"
+      npm_config_fetch_retry_mintimeout: "20000"
+      npm_config_fetch_retry_maxtimeout: "120000"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Les binaires Electron / electron-builder sont téléchargés depuis GitHub : on les met en cache pour ne pas dépendre du réseau à chaque build
+      - name: Cache Electron binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\electron\Cache
+            ~\AppData\Local\electron-builder\Cache
+          key: electron-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            electron-${{ runner.os }}-
+      # Un échec réseau temporaire (ex. erreur 504 au téléchargement d'Electron) ne fait plus échouer la compilation :
+      # jusqu'à 5 tentatives, avec un miroir de secours à partir de la 3e.
+      - name: Install dependencies (with retries)
+        shell: pwsh
+        run: |
+          $ok = $false
+          for ($i = 1; $i -le 5; $i++) {
+            Write-Host "npm install - tentative $i/5"
+            if ($i -ge 3) {
+              $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"
+              $env:ELECTRON_BUILDER_BINARIES_MIRROR = "https://npmmirror.com/mirrors/electron-builder-binaries/"
+              Write-Host "Miroir de secours activé"
+            }
+            npm install --no-audit --no-fund
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Write-Host "Échec de la tentative $i, nouvel essai dans $($i * 15) s..."
+            Start-Sleep -Seconds ($i * 15)
+            if (Test-Path "node_modules\electron") { Remove-Item "node_modules\electron" -Recurse -Force -ErrorAction SilentlyContinue }
+          }
+          if (-not $ok) { Write-Host "npm install a échoué après 5 tentatives"; exit 1 }
+      - name: Verify installer configuration
+        run: node scripts/fix-config.js
+      - name: Build Windows installer (with retries)
+        shell: pwsh
+        run: |
+          $ok = $false
+          for ($i = 1; $i -le 4; $i++) {
+            Write-Host "electron-builder - tentative $i/4"
+            if ($i -ge 3) {
+              $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"
+              $env:ELECTRON_BUILDER_BINARIES_MIRROR = "https://npmmirror.com/mirrors/electron-builder-binaries/"
+            }
+            npm run dist
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Start-Sleep -Seconds ($i * 20)
+          }
+          if (-not $ok) { Write-Host "La compilation a échoué après 4 tentatives"; exit 1 }
+      # Version commerciale : l'installateur n'est PAS publié en Release publique. Téléchargez-le dans « Artifacts » (dépôt privé) puis livrez-le via Chariow.
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: EcomVideoStudio-Windows
+          path: |
+            release/*.exe
+            release/*.blockmap
